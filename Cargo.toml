@@ -1,0 +1,16 @@
+[package]
+name = "vp9-mt"
+description = "Multi-threaded pure-Rust VP9 decoder: a fork of rusty_vp9 with tile-column threading"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+readme = "README.md"
+include = ["src/**", "tests/**", "LICENSE", "NOTICE", "CHANGES.md", "README.md"]
+rust-version = "1.85"
+keywords = ["vp9", "video", "codec", "decoder"]
+categories = ["multimedia::video"]
+
+[lib]
+name = "vp9_mt"
+
+[dependencies]

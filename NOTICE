@@ -1,0 +1,8 @@
+vp9-mt
+Copyright 2026 Mohamed A.
+
+vp9-mt is a modified version of rusty_vp9 0.1.1
+(https://github.com/Remade-With-Rust/remade_ffmpeg_rs), by Mata Network
+(https://www.mata.network), licensed under the Apache License, Version 2.0.
+The modifications are listed in CHANGES.md and are also licensed under the
+Apache License, Version 2.0.
