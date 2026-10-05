@@ -1,3 +1,4 @@
+// Modified by vp9-mt (fork of rusty_vp9 0.1.1): two unused `mut`s removed in tests. See CHANGES.md.
 //! VP9 inverse transforms (ISO/VP9 §8.7). The codec uses fixed-point integer
 //! DCT/ADST butterflies with 14-bit constants; this seeds stage 3 with the
 //! smallest, self-verifiable pieces — the 4-point inverse DCT and the lossless

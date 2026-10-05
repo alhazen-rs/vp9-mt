@@ -14,6 +14,7 @@ Network). Changes, all in the decoder:
 - **`Vp9Decoder::next_picture()` / `Picture`** (`src/lib.rs`): returns the decoder's reference
   buffer without the cropped byte copy that `next_frame()` makes (that copy was ~15% of decode
   time at 4K). `next_frame()` is unchanged.
+- Two unused `mut`s removed in `src/transform.rs` tests (compiler warnings).
 - **Removed the encoder** (`src/encode/` and its re-exports): vp9-mt is decoder-only.
 - Tests: `tests/threads.rs` (threaded output equals single-threaded, 100× stress at 16 threads).
 
