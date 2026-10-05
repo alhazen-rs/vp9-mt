@@ -1,4 +1,4 @@
-// Modified by vp9-mt (fork of rusty_vp9 0.1.1): superblock-row wavefront in loop_filter_frame. See CHANGES.md.
+// Modified by vp9-mt (fork of rusty_vp9 0.1.1): loop_filter_frame_parallel (planes on separate threads). See CHANGES.md.
 //! VP9 in-loop deblocking filter (ISO/VP9 §8.8 / libvpx `vp9_loopfilter.c` +
 //! `vpx_dsp/loopfilter.c`). Applied to the reconstructed frame after intra/inter
 //! reconstruction, before the frame is output or used as a reference.
@@ -1625,80 +1625,55 @@ mod tests {
 /// Deblock a fully-reconstructed frame in place. `planes` are (buf, stride) per
 /// plane with their subsampling; `mi_grid` is the row-major mode-info grid.
 #[allow(clippy::too_many_arguments)]
+/// vp9-mt: [`loop_filter_frame`] with the three planes filtered on separate threads. Each
+/// plane's filtering reads only the (shared, read-only) mode-info grid and writes only its own
+/// buffer, so the planes are independent, and each keeps the raster order: the result is
+/// identical to the single-threaded filter.
+pub fn loop_filter_frame_parallel(
+    planes: &mut [(&mut [u16], usize, usize, usize)], // (buf, stride, ss_x, ss_y)
+    mi_grid: &[ModeInfo],
+    mi_rows: usize,
+    mi_cols: usize,
+    h: &FrameHeader,
+) {
+    if h.loop_filter_level == 0 {
+        return;
+    }
+    std::thread::scope(|s| {
+        let mut planes = planes.iter_mut();
+        let first = planes.next();
+        for plane in planes {
+            s.spawn(move || loop_filter_frame(std::slice::from_mut(plane), mi_grid, mi_rows, mi_cols, h));
+        }
+        if let Some(plane) = first {
+            loop_filter_frame(std::slice::from_mut(plane), mi_grid, mi_rows, mi_cols, h);
+        }
+    });
+}
+
 pub fn loop_filter_frame(
     planes: &mut [(&mut [u16], usize, usize, usize)], // (buf, stride, ss_x, ss_y)
     mi_grid: &[ModeInfo],
     mi_rows: usize,
     mi_cols: usize,
     h: &FrameHeader,
-    threads: usize,
 ) {
     if h.loop_filter_level == 0 {
         return;
     }
     let lf = build_lf_info(h);
     let bd = h.bit_depth.max(8) as i32;
-    let sb_rows = mi_rows.div_ceil(MI_BLOCK_SIZE);
-    let sb_cols = mi_cols.div_ceil(MI_BLOCK_SIZE);
-    // vp9-mt: superblock-row wavefront, as libvpx's `vp9_loop_filter_frame_mt`. Filtering
-    // superblock (r, c) modifies up to 8 pixels left of it (row r) and above it (columns of c),
-    // and reads what (r-1, c+1)'s left-edge filtering wrote, so row r may process column c once
-    // row r-1 has finished column c+1. That reproduces the raster order's result exactly, and
-    // concurrently running superblocks never touch the same pixels.
-    let raw: Vec<(crate::decode::SendPtr<u16>, usize, usize, usize, usize)> = planes
-        .iter_mut()
-        .map(|(buf, stride, ss_x, ss_y)| {
-            (crate::decode::SendPtr(buf.as_mut_ptr()), buf.len(), *stride, *ss_x, *ss_y)
-        })
-        .collect();
-    let progress: Vec<std::sync::atomic::AtomicUsize> =
-        (0..sb_rows).map(|_| std::sync::atomic::AtomicUsize::new(0)).collect();
-    let next_row = std::sync::atomic::AtomicUsize::new(0);
-    // Set when a worker panics (malformed input), so the others stop waiting on its row; the
-    // panic itself propagates out of `run_workers` to the decoder's `catch_unwind`.
-    let aborted = std::sync::atomic::AtomicBool::new(false);
-    struct AbortOnPanic<'a>(&'a std::sync::atomic::AtomicBool);
-    impl Drop for AbortOnPanic<'_> {
-        fn drop(&mut self) {
-            if std::thread::panicking() {
-                self.0.store(true, std::sync::atomic::Ordering::Release);
-            }
-        }
-    }
-    use std::sync::atomic::Ordering;
-    crate::decode::run_workers(threads.min(sb_rows).max(1), || loop {
-        let _guard = AbortOnPanic(&aborted);
-        // Rows are claimed in order, so the row a worker waits on is always held by a running
-        // worker (or done): no deadlock, whatever the thread count.
-        let r = next_row.fetch_add(1, Ordering::Relaxed);
-        if r >= sb_rows {
-            break;
-        }
-        let mi_row = r * MI_BLOCK_SIZE;
-        for c in 0..sb_cols {
-            if r > 0 {
-                let need = (c + 2).min(sb_cols);
-                let mut spins = 0u32;
-                while progress[r - 1].load(Ordering::Acquire) < need {
-                    if aborted.load(Ordering::Acquire) {
-                        return;
-                    }
-                    spins += 1;
-                    if spins < 64 {
-                        std::hint::spin_loop();
-                    } else {
-                        std::thread::yield_now();
-                    }
-                }
-            }
-            let mi_col = c * MI_BLOCK_SIZE;
+    let mut mi_row = 0;
+    while mi_row < mi_rows {
+        let mut mi_col = 0;
+        while mi_col < mi_cols {
             // Build the masks ONCE per distinct subsampling and reuse them.
             // The mask depends only on (ss_x, ss_y) and the mi grid, so the U
             // and V planes — which always share a subsampling — produce
             // byte-identical masks. This removes one of the three walks over
             // the ModeInfo grid the loop filter made per superblock.
             let mut cached: Option<((usize, usize), SbMasks)> = None;
-            for (ptr, len, stride, ss_x, ss_y) in raw.iter() {
+            for (buf, stride, ss_x, ss_y) in planes.iter_mut() {
                 let key = (*ss_x, *ss_y);
                 let masks = match &cached {
                     Some((k, m)) if *k == key && !no_mask_share() => m,
@@ -1712,16 +1687,12 @@ pub fn loop_filter_frame(
                 };
                 let base_x = (mi_col * 8) >> *ss_x;
                 let base_y = (mi_row * 8) >> *ss_y;
-                // SAFETY: `ptr`/`len` come from a live `&mut [u16]` that outlives the workers.
-                // The wavefront above guarantees this superblock's pixel accesses are disjoint
-                // from every concurrently filtered superblock's, and the Acquire load orders
-                // them after the writes they depend on.
-                let buf = unsafe { std::slice::from_raw_parts_mut(ptr.0, *len) };
                 apply_sb_masks(
                     buf, *stride, base_x, base_y, *ss_y, &lf, masks, mi_rows, mi_row, mi_col, bd,
                 );
             }
-            progress[r].store(c + 1, Ordering::Release);
+            mi_col += MI_BLOCK_SIZE;
         }
-    });
+        mi_row += MI_BLOCK_SIZE;
+    }
 }

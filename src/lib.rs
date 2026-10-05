@@ -1,4 +1,4 @@
-// Modified by vp9-mt (fork of rusty_vp9 0.1.1): with_threads, next_picture/Picture, encoder removed. See CHANGES.md.
+// Modified by vp9-mt (fork of rusty_vp9 0.1.1): with_threads, next_picture/Picture, column buffer pool, encoder removed. See CHANGES.md.
 //! **vp9-mt** — a multi-threaded fork of rusty_vp9 (see CHANGES.md); the upstream docs follow.
 //!
 //! **rusty_vp9** — an in-house VP9 decoder + encoder, pure Rust with no C/FFI.
@@ -553,6 +553,8 @@ pub struct Vp9Decoder {
     bit_depth: u32,
     /// Worker threads (vp9-mt): 0 = available parallelism, 1 = single-threaded.
     threads: usize,
+    /// Tile-column worker buffers reused across frames (vp9-mt).
+    column_bufs: Vec<decode::ColumnBufs>,
     /// Colour space and range from the active key/intra frame (vp9-mt).
     color_space: u32,
     color_range: bool,
@@ -786,6 +788,7 @@ impl Vp9Decoder {
                 prev_seg_map,
                 recycled,
                 threads,
+                &mut self.column_bufs,
             )
         }));
         // Release the decode-time reference handles BEFORE the slot update below.

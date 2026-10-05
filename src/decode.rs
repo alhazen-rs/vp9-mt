@@ -1,4 +1,4 @@
-// Modified by vp9-mt (fork of rusty_vp9 0.1.1): tile-column threading (TileWorker, run_workers, SendPtr). See CHANGES.md.
+// Modified by vp9-mt (fork of rusty_vp9 0.1.1): tile-column threading (column workers, run_parallel). See CHANGES.md.
 //! VP9 key-frame reconstruction (ISO/VP9 §8 / libvpx `vp9_decodeframe.c`). This
 //! is where every primitive converges: the compressed-header probability
 //! updates build a [`FrameContext`]; the tile boolean decoder drives the
@@ -930,10 +930,14 @@ fn read_mv_probs(b: &mut BoolDecoder, nmvc: &mut NmvContext, allow_hp: bool) {
 struct Plane {
     buf: Vec<u16>,
     stride: usize,
+    /// Frame plane size (also in a tile-column worker, whose `buf` holds only its column).
     width: usize,
     height: usize,
     ss_x: usize,
     ss_y: usize,
+    /// vp9-mt: plane x of `buf`'s first sample — 0 for the frame, the column's left edge in a
+    /// tile-column worker. Pixel (x, y) is at `y * stride + (x - x0)`.
+    x0: usize,
 }
 
 /// A/B switch: re-zero recycled plane buffers (DEFAULT OFF — see the note in
@@ -993,6 +997,7 @@ impl Plane {
             height: h,
             ss_x,
             ss_y,
+            x0: 0,
         }
     }
 
@@ -1009,6 +1014,7 @@ impl Plane {
             height: h,
             ss_x,
             ss_y,
+            x0: 0,
         }
     }
 }
@@ -1071,85 +1077,80 @@ impl Seg {
 
 // ---- the decoder --------------------------------------------------------
 
-/// A tile-column decoder for one worker thread (vp9-mt).
-///
-/// It is a bitwise copy of the frame's [`Reconstructor`]: it shares every frame-wide buffer
-/// (`planes`, `mi`, `cur_seg_map`, `above_ctx`, `above_seg`) through the copied `Vec` pointers,
-/// and owns only what a tile column needs privately: `counts`, the left contexts (inline arrays,
-/// copied) and the coefficient scratch (`dqcoeff`, `token_cache`), which are replaced with fresh
-/// allocations. It is never dropped as a `Reconstructor`; [`TileWorker::finish`] frees exactly
-/// the fields it owns.
-///
-/// Soundness rests on VP9's tile rules (spec 6.4, libvpx `vp9_tile_init`): within a tile row,
-/// a tile column reads and writes only mode info, contexts, segment ids and reconstructed
-/// pixels inside its own mi-column range (`tile_col_start..tile_col_end`), and above-row data
-/// written by earlier tile rows, which are complete before the next row starts. So the workers
-/// of one tile row touch disjoint memory: no data race and no aliased access to a byte.
-/// No shared `Vec` is resized while workers run, and the base `Reconstructor` is not touched
-/// until every worker has finished (`std::thread::scope`).
-struct TileWorker(std::mem::ManuallyDrop<Reconstructor>);
-
-// SAFETY: see the type docs — workers only touch disjoint parts of the shared buffers, and the
-// `Arc`s they share (`refs`, `prev_mvs`, `prev_seg_map`) are only read or cloned atomically.
-unsafe impl Send for TileWorker {}
-
-impl TileWorker {
-    /// SAFETY: `base` must outlive the worker and must not be accessed while any worker exists.
-    unsafe fn new(base: *mut Reconstructor) -> TileWorker {
-        // SAFETY: the copy shares `base`'s heap buffers; it is wrapped in `ManuallyDrop` so they
-        // are never freed twice, and the three owned fields are overwritten without dropping
-        // the shared originals.
-        unsafe {
-            let mut w = std::mem::ManuallyDrop::new(std::ptr::read(base));
-            std::ptr::write(&mut w.counts, FrameCounts::zeroed());
-            std::ptr::write(&mut w.dqcoeff, vec![0i32; 1024]);
-            std::ptr::write(&mut w.token_cache, vec![0u8; 1024]);
-            TileWorker(w)
+/// Copies column-local buffers into a frame-wide one, columns in parallel. `cols[i]` is
+/// `(x0, width)` of column `i` in `dst` and `srcs[i]` its `(buffer, stride)`; `rows` rows are
+/// copied. Each column gets its own disjoint `&mut` row pieces (`split_at_mut`), so this is
+/// plain safe Rust.
+fn scatter_columns<T: Copy + Send + Sync>(
+    dst: &mut [T],
+    dst_stride: usize,
+    rows: usize,
+    cols: &[(usize, usize)],
+    srcs: &[(&[T], usize)],
+    threads: usize,
+) {
+    let mut pieces: Vec<Vec<&mut [T]>> = (0..cols.len()).map(|_| Vec::with_capacity(rows)).collect();
+    for row in dst.chunks_mut(dst_stride).take(rows) {
+        let mut rest = row;
+        let mut at = 0;
+        for (i, &(x0, w)) in cols.iter().enumerate() {
+            let (_, tail) = std::mem::take(&mut rest).split_at_mut(x0 - at);
+            let (piece, tail) = tail.split_at_mut(w);
+            pieces[i].push(piece);
+            rest = tail;
+            at = x0 + w;
         }
     }
-
-    /// Frees the worker's own fields and returns its symbol counts.
-    fn finish(mut self) -> FrameCounts {
-        drop(std::mem::take(&mut self.0.dqcoeff));
-        drop(std::mem::take(&mut self.0.token_cache));
-        // SAFETY: `counts` is owned by this worker (written in `new`) and is read out exactly
-        // once; the worker is then forgotten without dropping any field.
-        unsafe { std::ptr::read(&self.0.counts) }
-    }
-}
-
-impl std::ops::Deref for TileWorker {
-    type Target = Reconstructor;
-    fn deref(&self) -> &Reconstructor {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for TileWorker {
-    fn deref_mut(&mut self) -> &mut Reconstructor {
-        &mut self.0
-    }
-}
-
-/// A raw pointer handed to worker threads; each use site states why the access is sound.
-pub(crate) struct SendPtr<T>(pub(crate) *mut T);
-// SAFETY: only a carrier; every dereference is justified where it happens.
-unsafe impl<T> Send for SendPtr<T> {}
-// SAFETY: as above.
-unsafe impl<T> Sync for SendPtr<T> {}
-
-/// Runs `work` on `n` threads (the calling thread is one of them) and waits for all of them.
-pub(crate) fn run_workers<F: Fn() + Sync>(n: usize, work: F) {
-    if n <= 1 {
-        work();
-        return;
-    }
-    std::thread::scope(|s| {
-        for _ in 1..n {
-            s.spawn(&work);
+    let pieces: Vec<std::sync::Mutex<Vec<&mut [T]>>> = pieces.into_iter().map(std::sync::Mutex::new).collect();
+    run_parallel(cols.len(), threads, |i| {
+        let (src, stride) = srcs[i];
+        let w = cols[i].1;
+        for (y, piece) in pieces[i].lock().unwrap_or_else(|e| e.into_inner()).iter_mut().enumerate() {
+            piece.copy_from_slice(&src[y * stride..y * stride + w]);
         }
-        work();
     });
+}
+
+/// A tile-column worker's buffers, kept between frames (vp9-mt): allocating fresh zeroed
+/// buffers per frame cost ~3 ms per worker at 4K in page faults. Not zeroed on reuse, for the
+/// same reason the frame plane pool isn't: every coded pixel, mode-info cell and segment id of
+/// a column is written before anything reads it.
+#[derive(Default)]
+pub(crate) struct ColumnBufs {
+    planes: [Vec<u16>; 3],
+    mi: Vec<ModeInfo>,
+    seg: Vec<u8>,
+}
+
+/// Runs `work(i)` for `i` in `0..n` on up to `threads` threads (the calling thread is one of
+/// them), each `i` exactly once, and returns the results in order. Safe Rust only: every task
+/// owns its data.
+fn run_parallel<T: Send>(n: usize, threads: usize, work: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    let workers = threads.min(n).max(1);
+    if workers == 1 {
+        return (0..n).map(&work).collect();
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let claim = || {
+        let mut done = Vec::new();
+        loop {
+            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if i >= n {
+                return done;
+            }
+            done.push((i, work(i)));
+        }
+    };
+    let mut all: Vec<(usize, T)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (1..workers).map(|_| s.spawn(&claim)).collect();
+        let mut all = claim();
+        for h in handles {
+            all.extend(h.join().unwrap_or_else(|p| std::panic::resume_unwind(p)));
+        }
+        all
+    });
+    all.sort_by_key(|(i, _)| *i);
+    all.into_iter().map(|(_, t)| t).collect()
 }
 
 pub struct Reconstructor {
@@ -1165,6 +1166,10 @@ pub struct Reconstructor {
     tile_col_end: usize,
     mi_rows: usize,
     mi_cols: usize,
+    /// vp9-mt: `mi` and `cur_seg_map` cover mi columns `mi_c0..mi_c0 + mi_stride` (the whole
+    /// frame, or one tile column in a worker); `above_seg`/`above_ctx` start at `mi_c0` too.
+    mi_c0: usize,
+    mi_stride: usize,
     mi: Vec<ModeInfo>,
     planes: [Plane; 3],
     above_seg: Vec<u8>,
@@ -1193,9 +1198,16 @@ pub struct Reconstructor {
     token_cache: Vec<u8>,
     /// Worker threads for tile columns (vp9-mt); 1 = the upstream single-threaded path.
     threads: usize,
+    /// Reusable tile-column worker buffers (vp9-mt), handed back to the decoder after the frame.
+    column_bufs: Vec<ColumnBufs>,
 }
 
 impl Reconstructor {
+    /// Index of mi cell (row, col) in `mi` / `cur_seg_map` (column-local in a worker).
+    fn mi_at(&self, mi_row: usize, mi_col: usize) -> usize {
+        mi_row * self.mi_stride + (mi_col - self.mi_c0)
+    }
+
     /// The previous frame's MV record at this mi position, if temporal MV
     /// prediction is enabled for this frame.
     fn prev_mv(&self, mi_row: usize, mi_col: usize) -> Option<&MvRef> {
@@ -1220,7 +1232,8 @@ impl Reconstructor {
     fn set_seg_id(&mut self, mi_row: usize, mi_col: usize, x_mis: usize, y_mis: usize, sid: u8) {
         for y in 0..y_mis {
             for x in 0..x_mis {
-                self.cur_seg_map[(mi_row + y) * self.mi_cols + mi_col + x] = sid;
+                let at = self.mi_at(mi_row + y, mi_col + x);
+                self.cur_seg_map[at] = sid;
             }
         }
     }
@@ -1229,7 +1242,8 @@ impl Reconstructor {
             for y in 0..y_mis {
                 for x in 0..x_mis {
                     let off = (mi_row + y) * self.mi_cols + mi_col + x;
-                    self.cur_seg_map[off] = prev[off];
+                    let at = self.mi_at(mi_row + y, mi_col + x);
+                    self.cur_seg_map[at] = prev[off];
                 }
             }
         }
@@ -1347,6 +1361,7 @@ pub fn decode_intra_frame(
         None,
         None, // one-shot intra path: no buffer to recycle
         1,
+        &mut Vec::new(),
     )?;
     let mut out: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut widths = [0usize; 3];
@@ -1384,6 +1399,7 @@ pub fn decode_frame(
     prev_seg_map: Option<std::sync::Arc<Vec<u8>>>,
     recycled: Option<[Vec<u16>; 3]>,
     threads: usize,
+    column_bufs: &mut Vec<ColumnBufs>,
 ) -> crate::Result<(
     RefFrame,
     FrameContext,
@@ -1450,6 +1466,8 @@ pub fn decode_frame(
         tile_col_end: mi_cols,
         mi_rows,
         mi_cols,
+        mi_c0: 0,
+        mi_stride: mi_cols,
         mi: vec![ModeInfo::default(); mi_rows * mi_cols],
         planes: {
             let [r0, r1, r2] = match recycled {
@@ -1487,10 +1505,13 @@ pub fn decode_frame(
         dqcoeff: vec![0i32; 1024],
         token_cache: vec![0u8; 1024],
         threads,
+        column_bufs: std::mem::take(column_bufs),
     };
     drop(setup);
 
-    rec.decode_tiles(&data[end..], h.tile_cols_log2, h.tile_rows_log2)?;
+    let decoded = rec.decode_tiles(&data[end..], h.tile_cols_log2, h.tile_rows_log2);
+    *column_bufs = std::mem::take(&mut rec.column_bufs);
+    decoded?;
 
     // In-loop deblocking filter over the fully reconstructed frame.
     {
@@ -1501,14 +1522,17 @@ pub fn decode_frame(
             .collect();
         dprof!(
             DS::LoopFilter,
-            crate::loopfilter::loop_filter_frame(
-                &mut lf_planes,
-                &rec.mi,
-                rec.mi_rows,
-                rec.mi_cols,
-                h,
-                threads
-            )
+            if threads > 1 {
+                crate::loopfilter::loop_filter_frame_parallel(
+                    &mut lf_planes,
+                    &rec.mi,
+                    rec.mi_rows,
+                    rec.mi_cols,
+                    h,
+                )
+            } else {
+                crate::loopfilter::loop_filter_frame(&mut lf_planes, &rec.mi, rec.mi_rows, rec.mi_cols, h)
+            }
         );
     }
 
@@ -1605,12 +1629,10 @@ impl Reconstructor {
             c.iter_mut().for_each(|v| *v = 0);
         }
         self.above_seg.iter_mut().for_each(|v| *v = 0);
-        let threads = self.threads;
+        // Split every tile's payload first (sizes are sequential in the bitstream).
+        let mut tiles: Vec<Vec<&[u8]>> = Vec::with_capacity(tile_rows);
         for tr in 0..tile_rows {
-            let mr_start = tile_offset(tr, self.mi_rows, tile_rows_log2);
-            let mr_end = tile_offset(tr + 1, self.mi_rows, tile_rows_log2);
-            // Split the tile row into its column payloads first (sizes are sequential).
-            let mut tiles: Vec<&[u8]> = Vec::with_capacity(tile_cols);
+            let mut row = Vec::with_capacity(tile_cols);
             for tc in 0..tile_cols {
                 let last = tr == tile_rows - 1 && tc == tile_cols - 1;
                 let tile_data = if last {
@@ -1628,55 +1650,134 @@ impl Reconstructor {
                     off += sz;
                     d
                 };
-                tiles.push(tile_data);
+                row.push(tile_data);
             }
-            if tile_cols == 1 || threads <= 1 {
-                for (tc, tile_data) in tiles.into_iter().enumerate() {
-                    self.tile_col_start = tile_offset(tc, self.mi_cols, tile_cols_log2);
-                    self.tile_col_end = tile_offset(tc + 1, self.mi_cols, tile_cols_log2);
+            tiles.push(row);
+        }
+        let (mi_rows, mi_cols) = (self.mi_rows, self.mi_cols);
+        let rows = move |tr: usize| (tile_offset(tr, mi_rows, tile_rows_log2), tile_offset(tr + 1, mi_rows, tile_rows_log2));
+        let cols = move |tc: usize| (tile_offset(tc, mi_cols, tile_cols_log2), tile_offset(tc + 1, mi_cols, tile_cols_log2));
+
+        if tile_cols == 1 || self.threads <= 1 {
+            // The upstream single-threaded path, decoding straight into the frame.
+            for (tr, row) in tiles.iter().enumerate() {
+                let (mr_start, mr_end) = rows(tr);
+                for (tc, tile_data) in row.iter().enumerate() {
+                    (self.tile_col_start, self.tile_col_end) = cols(tc);
                     self.decode_tile(tile_data, mr_start, mr_end)?;
                 }
-                continue;
             }
-            // vp9-mt: tile columns are independent within a tile row, so worker threads claim
-            // columns in order and decode them into disjoint bands of the shared buffers.
-            let next = std::sync::atomic::AtomicUsize::new(0);
-            let results: std::sync::Mutex<Vec<(usize, crate::Result<FrameCounts>)>> =
-                std::sync::Mutex::new(Vec::with_capacity(tile_cols));
-            let mi_cols = self.mi_cols;
-            let base = SendPtr(self as *mut Reconstructor);
-            run_workers(threads.min(tile_cols), || {
-                let base = &base;
-                // SAFETY: `self` is not used until `run_workers` returns, and it outlives the
-                // workers; see `TileWorker` for why concurrent column decoding is sound.
-                let mut w = unsafe { TileWorker::new(base.0) };
-                let mut first_error = None;
-                loop {
-                    let tc = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if tc >= tile_cols {
-                        break;
-                    }
-                    w.tile_col_start = tile_offset(tc, mi_cols, tile_cols_log2);
-                    w.tile_col_end = tile_offset(tc + 1, mi_cols, tile_cols_log2);
-                    if let Err(e) = w.decode_tile(tiles[tc], mr_start, mr_end) {
-                        first_error.get_or_insert((tc, e));
-                    }
-                }
-                let counts = w.finish();
-                let mut out = results.lock().unwrap_or_else(|e| e.into_inner());
-                match first_error {
-                    Some((tc, e)) => out.push((tc, Err(e))),
-                    None => out.push((0, Ok(counts))),
-                }
-            });
-            let mut results = results.into_inner().unwrap_or_else(|e| e.into_inner());
-            // Report the leftmost failing column, as the single-threaded path would.
-            results.sort_by_key(|(tc, r)| (r.is_ok(), *tc));
-            for (_, r) in results {
-                self.counts.merge(&r?);
-            }
+            return Ok(());
         }
+
+        // vp9-mt: a tile column depends only on itself (VP9 forbids prediction and context
+        // across tile columns; the rows above it come from the same column's earlier tile
+        // rows), so each column is decoded, all its tile rows in order, by its own worker
+        // `Reconstructor` with column-local buffers — nothing is shared mutably — and the
+        // results are copied into the frame afterwards.
+        let mut pool = std::mem::take(&mut self.column_bufs);
+        pool.resize_with(tile_cols, ColumnBufs::default);
+        let pool: Vec<std::sync::Mutex<ColumnBufs>> = pool.into_iter().map(std::sync::Mutex::new).collect();
+        let base = &*self;
+        let done = run_parallel(tile_cols, self.threads, |tc| {
+            let (c0, c1) = cols(tc);
+            let bufs = std::mem::take(&mut *pool[tc].lock().unwrap_or_else(|e| e.into_inner()));
+            let mut w = base.column_worker(c0, c1, bufs);
+            for (tr, row) in tiles.iter().enumerate() {
+                let (mr_start, mr_end) = rows(tr);
+                w.decode_tile(row[tc], mr_start, mr_end)?;
+            }
+            Ok::<_, crate::Error>(w)
+        });
+        // Report the leftmost failing column, as the single-threaded path would.
+        let workers = done.into_iter().collect::<crate::Result<Vec<_>>>()?;
+        for w in &workers {
+            self.counts.merge(&w.counts);
+        }
+        self.take_columns(&workers);
+        self.column_bufs = workers.into_iter().map(Reconstructor::into_column_bufs).collect();
         Ok(())
+    }
+
+    /// A worker for mi columns `c0..c1`: the frame's read-only state (probabilities,
+    /// segmentation, references, previous-frame grids) plus its own column-sized frame
+    /// buffers, mode-info grid, segment map and contexts.
+    fn column_worker(&self, c0: usize, c1: usize, bufs: ColumnBufs) -> Reconstructor {
+        let cw = c1 - c0;
+        let ctx_cols = (cw + 7) & !7;
+        let ColumnBufs { planes: mut plane_bufs, mut mi, mut seg } = bufs;
+        let planes = std::array::from_fn(|p| {
+            let fp = &self.planes[p];
+            let x0 = (c0 * MI_SIZE) >> fp.ss_x;
+            // Column width plus the frame's right padding: blocks on the frame's right edge
+            // write past the coded width.
+            let stride = ((cw * MI_SIZE) >> fp.ss_x) + 64 + 8;
+            let rows = fp.buf.len() / fp.stride;
+            let mut buf = std::mem::take(&mut plane_bufs[p]);
+            buf.resize(stride * rows, 0);
+            Plane { buf, stride, width: fp.width, height: fp.height, ss_x: fp.ss_x, ss_y: fp.ss_y, x0 }
+        });
+        mi.resize(self.mi_rows * cw, ModeInfo::default());
+        seg.resize(self.mi_rows * cw, 0);
+        Reconstructor {
+            fc: self.fc.clone(),
+            lossless: self.lossless,
+            dq_y: self.dq_y,
+            dq_uv: self.dq_uv,
+            seg: self.seg.clone(),
+            prev_seg_map: self.prev_seg_map.clone(),
+            cur_seg_map: seg,
+            tile_col_start: c0,
+            tile_col_end: c1,
+            mi_rows: self.mi_rows,
+            mi_cols: self.mi_cols,
+            mi_c0: c0,
+            mi_stride: cw,
+            mi,
+            planes,
+            above_seg: vec![0u8; ctx_cols],
+            left_seg: [0u8; 8],
+            above_ctx: [vec![0u8; 2 * ctx_cols], vec![0u8; 2 * ctx_cols], vec![0u8; 2 * ctx_cols]],
+            left_ctx: [[0u8; 16]; 3],
+            is_inter_frame: self.is_inter_frame,
+            interp_filter: self.interp_filter,
+            allow_hp: self.allow_hp,
+            sign_bias: self.sign_bias,
+            refs: self.refs.clone(),
+            counts: FrameCounts::zeroed(),
+            prev_mvs: self.prev_mvs.clone(),
+            use_prev_mvs: self.use_prev_mvs,
+            max_px: self.max_px,
+            dqcoeff: vec![0i32; 1024],
+            token_cache: vec![0u8; 1024],
+            threads: 1,
+            column_bufs: Vec::new(),
+        }
+    }
+
+    /// A finished worker's buffers, for the next frame's worker of the same column.
+    fn into_column_bufs(self) -> ColumnBufs {
+        let [a, b, c] = self.planes;
+        ColumnBufs { planes: [a.buf, b.buf, c.buf], mi: self.mi, seg: self.cur_seg_map }
+    }
+
+    /// Copies the column workers' decoded pixels, mode info and segment ids into the frame.
+    fn take_columns(&mut self, workers: &[Reconstructor]) {
+        let threads = self.threads;
+        for p in 0..3 {
+            let (ss_x, ss_y) = (self.planes[p].ss_x, self.planes[p].ss_y);
+            let cols: Vec<(usize, usize)> =
+                workers.iter().map(|w| (w.planes[p].x0, (w.mi_stride * MI_SIZE) >> ss_x)).collect();
+            let srcs: Vec<(&[u16], usize)> = workers.iter().map(|w| (&w.planes[p].buf[..], w.planes[p].stride)).collect();
+            let rows = (self.mi_rows * MI_SIZE) >> ss_y;
+            let dst = &mut self.planes[p];
+            scatter_columns(&mut dst.buf, dst.stride, rows, &cols, &srcs, threads);
+        }
+        let cols: Vec<(usize, usize)> = workers.iter().map(|w| (w.mi_c0, w.mi_stride)).collect();
+        let mis: Vec<(&[ModeInfo], usize)> = workers.iter().map(|w| (&w.mi[..], w.mi_stride)).collect();
+        scatter_columns(&mut self.mi, self.mi_stride, self.mi_rows, &cols, &mis, threads);
+        let segs: Vec<(&[u8], usize)> = workers.iter().map(|w| (&w.cur_seg_map[..], w.mi_stride)).collect();
+        scatter_columns(&mut self.cur_seg_map, self.mi_stride, self.mi_rows, &cols, &segs, threads);
     }
 
     fn decode_tile(&mut self, tile_data: &[u8], mr_start: usize, mr_end: usize) -> crate::Result<()> {
@@ -1711,7 +1812,7 @@ impl Reconstructor {
         let has_rows = mi_row + hbs < self.mi_rows;
         let has_cols = mi_col + hbs < self.mi_cols;
 
-        let ctx = partition_plane_context(&self.above_seg, &self.left_seg, mi_row, mi_col, n8x8_l2);
+        let ctx = partition_plane_context(&self.above_seg, &self.left_seg, mi_row, mi_col - self.mi_c0, n8x8_l2);
         // Key/intra frames use the fixed kf partition probs; inter frames use the
         // frame-context (adapted + updated) partition probs.
         let probs = if self.is_inter_frame {
@@ -1762,7 +1863,7 @@ impl Reconstructor {
                 &mut self.above_seg,
                 &mut self.left_seg,
                 mi_row,
-                mi_col,
+                mi_col - self.mi_c0,
                 subsize,
                 num_8x8,
             );
@@ -1774,10 +1875,10 @@ impl Reconstructor {
         // The above neighbour is available across tile-row boundaries (only tile
         // *columns* are independent); it's unavailable only at the frame top.
         // Matches libvpx `up_available = (mi_row != 0)`.
-        (mi_row > 0).then(|| self.mi[(mi_row - 1) * self.mi_cols + mi_col])
+        (mi_row > 0).then(|| self.mi[self.mi_at(mi_row - 1, mi_col)])
     }
     fn left_mi(&self, mi_row: usize, mi_col: usize) -> Option<ModeInfo> {
-        (mi_col > self.tile_col_start).then(|| self.mi[mi_row * self.mi_cols + mi_col - 1])
+        (mi_col > self.tile_col_start).then(|| self.mi[self.mi_at(mi_row, mi_col - 1)])
     }
 
     fn decode_block(
@@ -1798,7 +1899,8 @@ impl Reconstructor {
         let y_mis = bh.min(self.mi_rows - mi_row);
         for y in 0..y_mis {
             for x in 0..x_mis {
-                self.mi[(mi_row + y) * self.mi_cols + mi_col + x] = mi;
+                let at = self.mi_at(mi_row + y, mi_col + x);
+                self.mi[at] = mi;
             }
         }
 
@@ -2084,12 +2186,12 @@ impl Reconstructor {
         let is_compound = mi.has_second_ref();
         let inter_mode_ctx = get_mode_context(
             &self.mi,
-            self.mi_cols,
+            self.mi_stride,
             self.mi_rows,
-            self.tile_col_start,
-            self.tile_col_end,
+            self.tile_col_start - self.mi_c0,
+            self.tile_col_end - self.mi_c0,
             mi_row,
-            mi_col,
+            mi_col - self.mi_c0,
             bsize,
         );
 
@@ -2135,12 +2237,12 @@ impl Reconstructor {
                             let frame = mi.ref_frame[r];
                             let (tmp, _) = find_mv_refs(
                                 &self.mi,
-                                self.mi_cols,
+                                self.mi_stride,
                                 self.mi_rows,
-                                self.tile_col_start,
-                                self.tile_col_end,
+                                self.tile_col_start - self.mi_c0,
+                                self.tile_col_end - self.mi_c0,
                                 mi_row,
-                                mi_col,
+                                mi_col - self.mi_c0,
                                 bsize,
                                 frame,
                                 &self.sign_bias,
@@ -2183,12 +2285,12 @@ impl Reconstructor {
                     let frame = mi.ref_frame[r];
                     let (tmp, _count) = find_mv_refs(
                         &self.mi,
-                        self.mi_cols,
+                        self.mi_stride,
                         self.mi_rows,
-                        self.tile_col_start,
-                        self.tile_col_end,
+                        self.tile_col_start - self.mi_c0,
+                        self.tile_col_end - self.mi_c0,
                         mi_row,
-                        mi_col,
+                        mi_col - self.mi_c0,
                         bsize,
                         frame,
                         &self.sign_bias,
@@ -2234,12 +2336,12 @@ impl Reconstructor {
         let find = |blk: i32| {
             find_mv_refs(
                 &self.mi,
-                self.mi_cols,
+                self.mi_stride,
                 self.mi_rows,
-                self.tile_col_start,
-                self.tile_col_end,
+                self.tile_col_start - self.mi_c0,
+                self.tile_col_end - self.mi_c0,
                 mi_row,
-                mi_col,
+                mi_col - self.mi_c0,
                 bsize,
                 frame,
                 &self.sign_bias,
@@ -2445,7 +2547,7 @@ impl Reconstructor {
             w: rf.w[plane] as i32,
             h: rf.h[plane] as i32,
         };
-        let dst_off = dst_y * stride + dst_x;
+        let dst_off = dst_y * stride + (dst_x - self.planes[plane].x0);
         // Reference scaling: a reference coded at a different resolution needs the
         // scaled convolve (libvpx `dec_build_inter_predictors`, scaled branch).
         // The scale factor comes from the *luma* frame dimensions and applies to
@@ -2565,7 +2667,9 @@ impl Reconstructor {
         // Plane pixel origin of this coding block.
         let base_x = (mi_col * MI_SIZE) >> ss_x;
         let base_y = (mi_row * MI_SIZE) >> ss_y;
-        let above_col0 = (mi_col * 2) >> ss_x; // 4×4 column in the above-context array
+        // 4×4 column in the above-context array (which starts at mi_c0; tile columns start on a
+        // superblock, so the subsampled offset is exact).
+        let above_col0 = ((mi_col - self.mi_c0) * 2) >> ss_x;
         let left_row0 = ((mi_row * 2) & 15) >> ss_y;
 
         let mut row = 0;
@@ -2634,7 +2738,9 @@ impl Reconstructor {
 
         let x0 = base_x + col * 4;
         let y0 = base_y + row * 4;
-        let dst_off = y0 * stride + x0;
+        // Column-local in a tile-column worker (px0 = 0 for the frame).
+        let px0 = self.planes[plane].x0;
+        let dst_off = y0 * stride + (x0 - px0);
 
         // Intra prediction (inter blocks are already motion-compensated).
         let mut intra_mode = 0u8;
@@ -2663,9 +2769,9 @@ impl Reconstructor {
                 right_avail,
                 &self.planes[plane].buf,
                 stride,
-                fw,
+                fw - px0 as i32,
                 fh,
-                x0 as i32,
+                (x0 - px0) as i32,
                 y0 as i32,
                 mb_to_right,
                 mb_to_bottom,
