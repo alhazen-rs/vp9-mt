@@ -70,3 +70,16 @@ fn picture_matches_cropped_frame() {
         assert_eq!(cropped, frame.planes[p]);
     }
 }
+
+const TILES2_TINY: &[u8] = include_bytes!("data/tiles2_tiny.ivf");
+
+/// Small enough to run under Miri (`cargo +nightly miri test -p vp9-mt --test threads tiny`):
+/// two 512x64 frames with 2 tile columns exercise the tile workers and the loop-filter
+/// wavefront, and Miri checks them for undefined behaviour and data races.
+#[test]
+fn tiny_two_tile_frames_match_single_threaded() {
+    let frames = ivf_frames(TILES2_TINY);
+    let reference = decode(&frames, 1);
+    assert_eq!(reference.len(), 2);
+    assert!(decode(&frames, 2) == reference);
+}
