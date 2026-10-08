@@ -2225,6 +2225,8 @@ mod sparse_tx_tests {
 
 #[cfg(test)]
 mod idct4_avx2_tests {
+    // vp9-mt: only the x86 tests below use it.
+    #[allow(unused_imports)]
     use super::*;
 
     /// Overflow proof for the AVX2 idct4×4 path: propagate value INTERVALS
