@@ -1,0 +1,33 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Optimized: the threaded tests decode real video, including a 100x stress run.
+      - run: cargo test --release --locked
+      - run: cargo clippy --all-targets --locked -- -D warnings
+
+  miri:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # The threading code under Miri's Tree Borrows model, on the tiny 2-tile clip.
+      - run: cargo miri test --locked --test threads tiny
+        env:
+          MIRIFLAGS: -Zmiri-tree-borrows
